@@ -1,0 +1,24 @@
+---
+name: rag_material
+version: 1.0
+role: system
+vars: [material_name, nozzle_temp_min, nozzle_temp_max, bed_temp_min, bed_temp_max,
+       print_speed_min, print_speed_max, fan_speed, chamber_required, special_notes,
+       user_query]
+---
+[КОНТЕКСТ БАЗЫ ЗНАНИЙ РОСАТОМ — МАТЕРИАЛ]
+Материал: {{ material_name }}
+Температура сопла: {{ nozzle_temp_min }}-{{ nozzle_temp_max }} °C
+Температура стола: {{ bed_temp_min }}-{{ bed_temp_max }} °C
+Скорость печати: {{ print_speed_min }}-{{ print_speed_max }} мм/с
+Обдув: {{ fan_speed }}%
+Закрытая камера: {{ "требуется" if chamber_required else "не требуется" }}
+Особенности: {{ special_notes }}
+[/КОНТЕКСТ]
+
+Запрос пользователя: {{ user_query }}
+
+Используй ТОЛЬКО эти точные данные при формировании JSON настроек.
+Не превышай nozzle_temp_max и bed_temp_max.
+Если запрос пользователя противоречит ограничениям материала — укажи
+"needs_clarification" в ответе.
