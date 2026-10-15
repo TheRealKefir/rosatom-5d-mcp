@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..five_axis_postproc import FiveAxisLimits, postprocess_gcode, postprocess_lines
+from ..five_axis_postproc import FiveAxisPostProcessor as _LegacyFiveAxisPostProcessor
+from ..five_axis_postproc import KinematicTableConfig, FiveAxisPostprocStats
 
 
 class FiveAxisPostProcessor:
@@ -16,17 +17,17 @@ class FiveAxisPostProcessor:
         input_path: str | Path,
         output_path: str | Path,
         *,
-        limits: FiveAxisLimits | None = None,
-    ) -> dict[str, Any]:
-        return postprocess_gcode(input_path, output_path, limits=limits)
+        limits: KinematicTableConfig | None = None,
+    ) -> FiveAxisPostprocStats:
+        return _LegacyFiveAxisPostProcessor(limits).process_gcode(input_path, output_path)
 
     def process_lines(
         self,
         lines: Iterable[str],
         *,
-        limits: FiveAxisLimits | None = None,
+        limits: KinematicTableConfig | None = None,
     ) -> tuple[list[str], dict[str, int]]:
-        return postprocess_lines(lines, limits)
+        raise NotImplementedError("The legacy post-processor works with files; use process().")
 
 
-__all__ = ["FiveAxisLimits", "FiveAxisPostProcessor", "postprocess_gcode", "postprocess_lines"]
+__all__ = ["KinematicTableConfig", "FiveAxisPostprocStats", "FiveAxisPostProcessor"]

@@ -5,13 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..slicer_cli import (
-    FilamentDatabase,
-    FilamentProfile,
-    generate_gcode,
-    get_filament_profile,
-    load_filament_database,
-)
+from ..slicer_cli import SlicerCLI, SlicingJobResult
 
 
 class SlicerService:
@@ -28,25 +22,13 @@ class SlicerService:
         slicer_binary: str | None = None,
         use_external: bool = True,
     ) -> dict[str, Any]:
-        return generate_gcode(
-            stl_path,
-            material,
-            layer_height_mm,
-            infill_percent,
-            output_path,
-            slicer_binary=slicer_binary,
-            use_external=use_external,
-        )
+        return SlicerCLI().slice_mesh(stl_path, output_path, material, layer_height_mm, infill_percent).to_dict()
 
-    def profile(self, material: str) -> FilamentProfile:
-        return get_filament_profile(material)
+    def profile(self, material: str) -> dict[str, Any]:
+        return SlicerCLI().filaments_db.get(material.upper(), SlicerCLI().filaments_db["PLA"])
 
 
 __all__ = [
-    "FilamentDatabase",
-    "FilamentProfile",
+    "SlicingJobResult",
     "SlicerService",
-    "generate_gcode",
-    "get_filament_profile",
-    "load_filament_database",
 ]

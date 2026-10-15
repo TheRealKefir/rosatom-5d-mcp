@@ -18,6 +18,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import trimesh
+from .profiles.loader import load_filaments
 
 
 @dataclass
@@ -48,8 +49,7 @@ class SlicerCLI:
         filaments_file = self.profiles_dir / "filaments.json"
         if filaments_file.is_file():
             try:
-                with open(filaments_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                return load_filaments(filaments_file)
             except Exception:
                 pass
         return {

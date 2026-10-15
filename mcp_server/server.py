@@ -22,6 +22,7 @@ from mcp_server.five_axis_postproc import FiveAxisPostProcessor
 from mcp_server.mesh_analyzer import MeshAnalyzer
 from mcp_server.security_guard import SecurityGuard
 from mcp_server.slicer_cli import SlicerCLI
+from mcp_server.profiles.loader import load_filaments
 
 # Initialize FastMCP Server
 mcp = FastMCP("Rosatom 5D Additive Manufacturing MCP Server")
@@ -39,7 +40,7 @@ def _get_filaments_data() -> Dict[str, Any]:
     if PROFILES_PATH.is_file():
         try:
             with open(PROFILES_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                return load_filaments(PROFILES_PATH)
         except Exception:
             pass
     return {}

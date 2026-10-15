@@ -37,12 +37,12 @@ class PrintingCore:
         strength = bool(strength_priority)
         return {
             "material": material,
-            "nozzle_temp": profile.nozzle_temperature_c.recommended,
-            "bed_temp": profile.bed_temperature_c.recommended,
-            "print_speed": round(max(profile.print_speed_mm_s.min, profile.print_speed_mm_s.recommended * (0.65 if strength else 1.0)), 2),
+            "nozzle_temp": profile.get("nozzle_temp_recommended_c", 215),
+            "bed_temp": profile.get("bed_temp_recommended_c", 60),
+            "print_speed": profile.get("print_speed_recommended_mm_s", 50),
             "infill_percent": 80 if strength else 35,
-            "layer_height": profile.layer_height_mm.min if strength else profile.layer_height_mm.recommended,
-            "cooling_percent": profile.cooling_percent.recommended,
+            "layer_height": 0.15 if strength else 0.2,
+            "cooling_percent": profile.get("cooling_fan_percent", 100),
             "supports": analysis["printability"]["supports_recommended"],
             "geometry": analysis,
         }

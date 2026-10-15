@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..security_guard import verify_gcode
+from .gcode_parser import GCodeSecurityService
 
 
 DEFAULT_FLEET: dict[str, dict[str, Any]] = {
@@ -50,8 +50,8 @@ class FleetService:
             raise ValueError(f"unknown printer_id {printer_id!r}")
         printer = self._fleet[printer_id]
         bed = printer["bed_size_mm"]
-        report = verify_gcode(gcode_path, bed_size_mm=(float(bed["x"]), float(bed["y"])))
-        if not report["safe"]:
+        report = GCodeSecurityService().verify(gcode_path, bed_size_mm=(float(bed["x"]), float(bed["y"])))
+        if not report["is_safe"]:
             return {
                 "status": "REJECTED_SECURITY",
                 "printer_id": printer_id,
