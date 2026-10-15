@@ -1,39 +1,58 @@
+"""
+Central prompt registry — loads .md / .j2 templates from the prompts/ folder.
+Supports both:
+ - Simple file loading (by filename)
+ - Jinja2 template rendering with variables
+"""
+
 from __future__ import annotations
-from dataclasses import dataclass, field
+
 from pathlib import Path
-from typing import Any, Literal
-import json
+from typing import Optional
 
-Role = Literal["system", "user", "assistant"]
+from jinja2 import Environment, FileSystemLoader
+from loguru import logger
 
-@dataclass(frozen=True, slots=True)
-class PromptMeta:
-    name: str
-    version: str = "1.0"
-    role: Role = "system"
-    model: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
-    vars: tuple[str, ...] = ()
-    tags: tuple[str, ...] = ()
-    path: Path | None = None
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-@dataclass(frozen=True, slots=True)
-class Prompt:
-    meta: PromptMeta
-    body: str
-    _template: Any = field(repr=False, default=None, compare=False)
+_env = Environment(loader=FileSystemLoader(str(PROMPTS_DIR)), autoescape=False)
 
-    def render(self, **values: Any) -> str:
-        if not self.meta.vars:
-            return self.body.strip()
-        missing = set(self.meta.vars) - values.keys()
-        if missing:
-            raise KeyError(f"[{self.meta.name}] no such variables: {sorted(missing)}")
-        return self._template.render(**values).strip()
 
-    def as_message(self, **values: Any) -> dict:
-        return {"role": self.meta.role, "content": self.render(**values)}
+def load_prompt(name: str, **kwargs) -> str:
+    """
+    Load a prompt template by filename (with extension).
+    Jinja2 variables are filled from kwargs.
+    """
+    tpl = _env.get_template(name)
+    return tpl.render(**kwargs)
 
-    def __str__(self) -> str:
-        return self.body.strip()
+
+def _safe_read(filename: str) -> str:
+    """Safely read a prompt file, stripping YAML front matter if present."""
+    path = PROMPTS_DIR / filename
+    if not path.exists():
+        logger.warning("Prompt file not found: {}", path)
+        return ""
+    
+    text = path.read_text(encoding="utf-8")
+    
+    # Strip YAML front matter (---\n...\n---\n)
+    if text.startswith("---"):
+        lines = text.split("\n")
+        end_idx = -1
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                end_idx = i
+                break
+        if end_idx > 0:
+            text = "\n".join(lines[end_idx + 1:])
+    
+    return text.strip()
+
+
+# Pre-load commonly used system prompts
+MAIN_SYSTEM = _safe_read("main_agents.system.md")
+VISION_SYSTEM = _safe_read("vision_analyzer.system.md")
+PARAMS_SYSTEM = _safe_read("params_calculator.system.md")
+REPORT_SYSTEM = _safe_read("report_formatter.system.md")
+SAFETY_SYSTEM = _safe_read("safety_refusal.system.md")

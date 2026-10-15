@@ -1,260 +1,152 @@
+"""
+Rosatom 5D MCP Orchestrator — FastAPI backend.
+
+Provides REST + WebSocket endpoints for:
+ • uploading STL / photos
+ • streaming agent responses (tool calls + LLM reasoning)
+ • printer fleet dashboard
+ • 3D vs 5D comparison
+ • closed-loop defect correction
+"""
+
+from __future__ import annotations
+
+import asyncio
 import inspect
+import json
+import os
 import shutil
-import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel, Field
+import uvicorn
 
-# Добавляем корень монорепозитория в sys.path для прямого импорта mcp_server
-BASE_DIR = Path(__file__).resolve().parent.parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+from agent.router import AgentRouter
 
-STORAGE_DIR = BASE_DIR / "storage"
-STL_DIR = STORAGE_DIR / "uploads_stl"
-RENDERS_DIR = STORAGE_DIR / "renders_png"
-GCODE_DIR = STORAGE_DIR / "generated_gcode"
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 
-for folder in (STL_DIR, RENDERS_DIR, GCODE_DIR):
-    folder.mkdir(parents=True, exist_ok=True)
+STORAGE = Path(os.getenv("STORAGE_DIR", str(Path(__file__).resolve().parent.parent / "storage")))
+STL_DIR = STORAGE / "uploads_stl"
+RENDERS_DIR = STORAGE / "renders_png"
+GCODE_DIR = STORAGE / "generated_gcode"
 
-# Пробуем импортировать модуль mcp_server.server
-try:
-    from mcp_server import server as mcp_srv
-    logger.success("Модуль mcp_server.server успешно подключен к Orchestrator!")
-except Exception as e:
-    mcp_srv = None
-    logger.warning(f"mcp_server.server пока не доступен ({e}). Включен режим встроенных контрактных заглушек.")
+for d in (STL_DIR, RENDERS_DIR, GCODE_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
 
-# =====================================================================
-# Менеджер WebSocket для стриминга вызовов @mcp.tool() на фронтенд
-# =====================================================================
+# ---------------------------------------------------------------------------
+# WebSocket Connection Manager (for live tool-call streaming to frontend)
+# ---------------------------------------------------------------------------
+
 class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
+    """Manages active WebSocket connections per session."""
 
-    async def connect(self, session_id: str, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections[session_id] = websocket
-        logger.info(f"WebSocket подключен: session_id={session_id}")
+    def __init__(self):
+        self.active: dict[str, WebSocket] = {}
+
+    async def connect(self, session_id: str, ws: WebSocket):
+        await ws.accept()
+        self.active[session_id] = ws
+        logger.info("WebSocket connected: session_id={}", session_id)
 
     def disconnect(self, session_id: str):
-        self.active_connections.pop(session_id, None)
+        self.active.pop(session_id, None)
+        logger.info("WebSocket disconnected: session_id={}", session_id)
 
-    async def send_event(self, session_id: str, event_type: str, payload: dict[str, Any]):
-        ws = self.active_connections.get(session_id)
+    async def send_event(self, session_id: str, event: dict):
+        ws = self.active.get(session_id)
         if ws:
             try:
-                await ws.send_json({"event": event_type, "data": payload})
-            except Exception as exc:
-                logger.warning(f"Ошибка отправки WS-события: {exc}")
+                await ws.send_json(event)
+            except Exception as e:
+                logger.warning("Failed to send WS event: {}", e)
 
 
 ws_manager = ConnectionManager()
 
 
-# =====================================================================
-# Универсальный вызыватель инструментов MCP-сервера (7 тулов из доки)
-# =====================================================================
-async def invoke_mcp_tool(
-    tool_name: str,
-    kwargs: dict[str, Any],
-    session_id: Optional[str] = None,
-    trace_log: Optional[list[dict[str, Any]]] = None,
-) -> dict[str, Any]:
-    """
-    Вызывает инструмент @mcp.tool() из mcp_server/server.py,
-    стримит статус в WebSocket и сохраняет трассировку для UI.
-    """
-    logger.info(f"[MCP CALL] {tool_name}({kwargs})")
-    if session_id:
-        await ws_manager.send_event(session_id, "mcp_tool_start", {"tool": tool_name, "args": kwargs})
+# ---------------------------------------------------------------------------
+# Pydantic schemas for REST API
+# ---------------------------------------------------------------------------
 
-    result: Any = None
-
-    # 1. Если mcp_server/server.py реализован — вызываем реальную функцию
-    if mcp_srv is not None and hasattr(mcp_srv, tool_name):
-        fn = getattr(mcp_srv, tool_name)
-        try:
-            if inspect.iscoroutinefunction(fn):
-                result = await fn(**kwargs)
-            else:
-                result = fn(**kwargs)
-        except Exception as exc:
-            logger.error(f"Ошибка внутри MCP-инструмента {tool_name}: {exc}")
-            result = {"error": str(exc), "status": "FAILED"}
-    else:
-        # 2. Контрактный fallback (строго по документации твоих 7 тулов)
-        result = _fallback_mcp_execution(tool_name, kwargs)
-
-    if trace_log is not None:
-        trace_log.append({"tool": tool_name, "args": kwargs, "result": result})
-
-    if session_id:
-        await ws_manager.send_event(session_id, "mcp_tool_result", {"tool": tool_name, "result": result})
-
-    return result
+class ChatRequest(BaseModel):
+    prompt: str = Field(..., description="User text prompt")
+    session_id: Optional[str] = None
+    material: Optional[str] = None
+    auto_send_to_printer: bool = False
 
 
-def _fallback_mcp_execution(tool_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Fallback-ответы, на 100% соответствующие документации 7 инструментов."""
-    if tool_name == "analyze_stl":
-        return {
-            "stl_path": kwargs["stl_path"],
-            "dimensions_mm": {"x": 85.0, "y": 62.5, "z": 44.0},
-            "volume_cm3": 38.4,
-            "surface_area_cm2": 142.6,
-            "overhang_percent": 31.5,
-            "bed_detachment_risk": "LOW",
-            "recommended_mode": "5D",
-            "verdict": "Выявлено 31.5% нависаний (>45°). Рекомендована 5D-печать без поддержек.",
-        }
-
-    if tool_name == "recommend_print_parameters":
-        mat = kwargs.get("material", "PA12-CF").upper()
-        strength = kwargs.get("strength_priority", False)
-        temps = {
-            "PLA": (210, 60),
-            "PETG": (240, 75),
-            "ABS": (255, 105),
-            "PA12-CF": (280, 100),
-            "PEEK": (400, 140),
-        }
-        nozzle, bed = temps.get(mat, (250, 90))
-        return {
-            "material": mat,
-            "nozzle_temp": nozzle,
-            "bed_temp": bed,
-            "print_speed": 45 if strength else 65,
-            "infill_percent": 80 if strength else 40,
-            "layer_height": 0.15 if strength else 0.2,
-            "supports_strategy": "NONE_5D_MULTIAXIS" if mat in ("PA12-CF", "PEEK") else "AUTO_TREE",
-        }
-
-    if tool_name == "generate_safe_gcode":
-        out_path = Path(kwargs["output_gcode_path"])
-        mode_5d = kwargs.get("mode_5d", False)
-        gcode_content = (
-            f"; Rosatom Safe G-Code | Material: {kwargs.get('material')} | 5D: {mode_5d}\n"
-            "G28 X Y Z ; Safe Homing\n"
-            f"G1 Z{kwargs.get('layer_height', 0.2)} F1200\n"
-            + ("G1 X40 Y40 A25.0 B90.0 E4.2 F1800 ; 5D Stereotech Kinematics\n" if mode_5d else "G1 X40 Y40 E4.2 F1800\n")
-        )
-        out_path.write_text(gcode_content, encoding="utf-8")
-        return {
-            "status": "GENERATED",
-            "output_gcode_path": str(out_path),
-            "estimated_print_time": "1h 45m" if mode_5d else "2h 30m",
-            "filament_weight_g": 68.4 if mode_5d else 96.2,
-            "security_precheck": "PASSED",
-        }
-
-    if tool_name == "verify_gcode_security":
-        return {
-            "gcode_path": kwargs["gcode_path"],
-            "is_safe": True,
-            "warnings": [],
-            "violations": [],
-            "sha256_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        }
-
-    if tool_name == "diagnose_print_defect_or_spool":
-        defect = kwargs.get("defect_type", "warping")
-        return {
-            "defect_type": defect,
-            "current_material": kwargs.get("current_material", "ABS"),
-            "parameter_adjustments": {
-                "bed_temp_delta": "+10°C",
-                "cooling_fan_percent": 0,
-                "retraction_speed_mm_s": 40,
-                "brim_width_mm": 8,
-            },
-            "operator_actions": [
-                "Обезжирить печатный стол изопропанолом и нанести адгезив",
-                "Просушить катушку филамента при 70°C в течение 4 часов",
-                "Закрыть дверцу термокамеры принтера",
-            ],
-        }
-
-    if tool_name == "get_fleet_status":
-        return {
-            "printer_3d_1": {
-                "name": "Voron 2.4 Industrial",
-                "kinematics": "3D",
-                "status": "IDLE",
-                "max_nozzle_temp": 300,
-                "max_bed_temp": 120,
-            },
-            "printer_5d_1": {
-                "name": "Stereotech STE 530 Hybrid",
-                "kinematics": "5D",
-                "status": "IDLE",
-                "max_nozzle_temp": 420,
-                "max_bed_temp": 150,
-            },
-        }
-
-    if tool_name == "send_to_printer":
-        return {
-            "status": "DISPATCHED",
-            "printer_id": kwargs["printer_id"],
-            "gcode_path": kwargs["gcode_path"],
-            "verified_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "message": f"Задание успешно отправлено на {kwargs['printer_id']}. Начат прогрев стола и экструдера.",
-        }
-
-    return {"error": f"Неизвестный инструмент {tool_name}"}
+class ChatResponse(BaseModel):
+    session_id: str
+    response: str
+    preprocess_events: list[dict] = []
+    elapsed_seconds: float = 0.0
+    stl_url: Optional[str] = None
+    gcode_url: Optional[str] = None
 
 
-# =====================================================================
-# Вспомогательные парсеры интента из текста пользователя
-# =====================================================================
-def extract_material_from_text(text: str) -> str:
-    t = text.upper()
-    for mat in ("PA12-CF", "PEEK", "PETG", "ABS", "PLA", "ASA", "PC", "NYLON"):
-        if mat in t:
-            return mat
-    if "УГЛЕ" in t or "КАРБОН" in t or "ПОЛИАМИД" in t:
-        return "PA12-CF"
-    if "ВЫСОКОТЕМП" in t or "АТОМ" in t:
-        return "PEEK"
-    return "PA12-CF"  # Дефолтный инженерный пластик для 5D
+class CompareRequest(BaseModel):
+    stl_path: str
+    slicer_params_3d: dict = {}
+    slicer_params_5d: dict = {}
 
 
-def extract_defect_from_text(text: str) -> Optional[str]:
-    t = text.lower()
-    if any(w in t for w in ("паутин", "волос", "сопл", "stringing")):
-        return "stringing"
-    if any(w in t for w in ("отрыв", "угл", "загиб", "отлип", "warping", "деламин", "трещин")):
-        return "warping"
-    if any(w in t for w in ("смещ", "сдвиг", "ступен", "layer_shift", "shift")):
-        return "layer_shift"
-    if any(w in t for w in ("недоэкструз", "пропуск", "дыр", "underextrusion", "катушк", "влажн")):
-        return "underextrusion"
-    return None
+class DefectCorrectionRequest(BaseModel):
+    photo_path: str
+    stl_path: str
+    current_params: dict
+    session_id: Optional[str] = None
 
 
-# =====================================================================
-# Инициализация FastAPI
-# =====================================================================
+class DispatchRequest(BaseModel):
+    printer_id: str
+    gcode_path: str
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (startup / shutdown)
+# ---------------------------------------------------------------------------
+
+_agent: Optional[AgentRouter] = None
+
+
+async def _get_agent() -> AgentRouter:
+    global _agent
+    if _agent is None:
+        _agent = AgentRouter()
+        await _agent.startup()
+    return _agent
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Запуск Rosatom 3D/5D Orchestrator API...")
+    logger.info("🚀 Starting Rosatom 5D Orchestrator...")
+    agent = await _get_agent()
     yield
-    logger.info("Остановка Rosatom 3D/5D Orchestrator API...")
+    logger.info("🛑 Shutting down Rosatom 5D Orchestrator...")
+    await agent.shutdown()
 
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Rosatom 3D/5D Print MCP Orchestrator",
-    description="API оркестратора, интегрированное с 7 инструментами @mcp.tool() из mcp_server/server.py",
+    description=(
+        "API оркестратора для автоматического подбора параметров FDM 3D/5D-печати, "
+        "генерации G-кода и управления парком принтеров через MCP-протокол"
+    ),
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -262,314 +154,238 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Раздача статики (STL, рендеры, готовый G-код) для 3D/G-code вьювера на фронтенде
-app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
+# Serve storage files for frontend (STL viewer, G-code previews)
+if STORAGE.exists():
+    app.mount("/storage", StaticFiles(directory=str(STORAGE)), name="storage")
 
 
-# =====================================================================
-# Схемы запросов и ответов (Pydantic)
-# =====================================================================
-class ChatOrchestratorResponse(BaseModel):
-    session_id: str
-    reply: str
-    stl_url: Optional[str] = None
-    gcode_url: Optional[str] = None
-    # Результаты работы каждого из 7 MCP-инструментов:
-    stl_analysis: Optional[dict[str, Any]] = None
-    recommended_parameters: Optional[dict[str, Any]] = None
-    gcode_generation: Optional[dict[str, Any]] = None
-    security_audit: Optional[dict[str, Any]] = None
-    defect_diagnosis: Optional[dict[str, Any]] = None
-    fleet_status: Optional[dict[str, Any]] = None
-    dispatch_result: Optional[dict[str, Any]] = None
-    mcp_tool_trace: list[dict[str, Any]] = Field(default_factory=list)
+# ---------------------------------------------------------------------------
+# REST: Upload + Chat (main endpoint)
+# ---------------------------------------------------------------------------
 
-
-class DiagnoseRequest(BaseModel):
-    defect_type: str = Field(..., examples=["warping", "stringing", "layer_shift", "underextrusion"])
-    observed_symptoms: str = Field(..., examples=["Отрывает правый угол детали из ABS на 15-м слое"])
-    current_material: Optional[str] = Field(default="ABS")
-
-
-class VerifyGcodeRequest(BaseModel):
-    gcode_path: str
-
-
-class SendToPrinterRequest(BaseModel):
-    printer_id: str = Field(..., examples=["printer_5d_1", "printer_3d_1"])
-    gcode_path: str
-
-
-# =====================================================================
-# 1. ГЛАВНЫЙ ЭНДПОИНТ ЧАТА (Оркестрация всех 7 тулов MCP)
-# =====================================================================
-@app.post("/api/chat", response_model=ChatOrchestratorResponse)
-async def chat_endpoint(
-    message: str = Form(..., description="Текстовый запрос пользователя"),
-    session_id: str = Form(default_factory=lambda: str(uuid.uuid4())),
-    material: Optional[str] = Form(default=None, description="Явно выбранный пластик (опционально)"),
-    strength_priority: Optional[bool] = Form(default=None, description="Приоритет максимальной прочности"),
-    auto_send_to_printer: bool = Form(default=False, description="Сразу отправить на свободный принтер"),
-    stl_file: Optional[UploadFile] = File(default=None, description="Файл 3D-модели (.stl)"),
-    photo_file: Optional[UploadFile] = File(default=None, description="Фото дефекта печати, катушки или чертежа"),
+@app.post("/api/upload", response_model=ChatResponse)
+async def upload_and_chat(
+    stl: Optional[UploadFile] = File(None),
+    photo: Optional[UploadFile] = File(None),
+    prompt: str = Form(""),
+    session_id: Optional[str] = Form(None),
+    material: Optional[str] = Form(None),
+    auto_send_to_printer: bool = Form(False),
 ):
-    trace_log: list[dict[str, Any]] = []
-    reply_parts: list[str] = []
-    file_prefix = uuid.uuid4().hex[:8]
-
+    """
+    Accept STL model, photo and/or text prompt.
+    Runs the full agent pipeline: analysis → reasoning → slicing → response.
+    """
+    sid = session_id or uuid.uuid4().hex[:12]
+    paths: dict[str, str] = {}
     stl_url: Optional[str] = None
     gcode_url: Optional[str] = None
-    stl_analysis_res: Optional[dict[str, Any]] = None
-    params_res: Optional[dict[str, Any]] = None
-    gcode_res: Optional[dict[str, Any]] = None
-    security_res: Optional[dict[str, Any]] = None
-    defect_res: Optional[dict[str, Any]] = None
-    fleet_res: Optional[dict[str, Any]] = None
-    dispatch_res: Optional[dict[str, Any]] = None
 
-    chosen_material = (material or extract_material_from_text(message)).upper()
-    is_strength_priority = (
-        strength_priority
-        if strength_priority is not None
-        else any(w in message.lower() for w in ("прочн", "нагрузк", "удар", "силов", "кронштейн"))
-    )
+    # Save uploaded files
+    if stl:
+        if not stl.filename.lower().endswith(".stl"):
+            raise HTTPException(status_code=400, detail="Файл должен иметь расширение .stl")
+        dest = STL_DIR / f"{sid}_{stl.filename}"
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(stl.file, f)
+        paths["stl"] = str(dest)
+        stl_url = f"/storage/uploads_stl/{dest.name}"
 
-    # -----------------------------------------------------------------
-    # ВЕТКА А: Загружена STL-модель -> Анализ, Параметры, G-code, Аудит
-    # -----------------------------------------------------------------
-    if stl_file and stl_file.filename:
-        if not stl_file.filename.lower().endswith(".stl"):
-            raise HTTPException(status_code=400, detail="Файл модели должен иметь расширение .stl")
+    if photo:
+        dest = RENDERS_DIR / f"{sid}_{photo.filename}"
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(photo.file, f)
+        paths["photo"] = str(dest)
 
-        saved_stl_path = STL_DIR / f"{file_prefix}_{stl_file.filename}"
-        with saved_stl_path.open("wb") as buffer:
-            shutil.copyfileobj(stl_file.file, buffer)
-        stl_url = f"/storage/uploads_stl/{saved_stl_path.name}"
+    # Enrich prompt with material preference if specified
+    full_prompt = prompt
+    if material:
+        full_prompt = f"{prompt}\n\nПользователь указал предпочтительный материал: {material}"
+    if auto_send_to_printer:
+        full_prompt += "\n\nПосле генерации G-кода автоматически отправь на подходящий принтер."
 
-        # Тул №1: analyze_stl(stl_path)
-        stl_analysis_res = await invoke_mcp_tool(
-            "analyze_stl",
-            {"stl_path": str(saved_stl_path)},
-            session_id=session_id,
-            trace_log=trace_log,
-        )
+    agent = await _get_agent()
+    result = await agent.run(prompt=full_prompt, files=paths, session_id=sid)
 
-        rec_mode_raw = str(stl_analysis_res.get("recommended_mode", "5D")).upper()
-        mode_5d_flag = "5D" in rec_mode_raw
+    # Extract gcode URL from response if available
+    response_text = result.get("response", "")
+    for evt in result.get("preprocess_events", []):
+        if evt.get("tool") == "slice_model_to_gcode" and "result" in evt:
+            gpath = evt["result"].get("gcode_path", "")
+            if gpath:
+                gcode_url = f"/storage/generated_gcode/{Path(gpath).name}"
 
-        # Тул №2: recommend_print_parameters(stl_path, material, strength_priority)
-        params_res = await invoke_mcp_tool(
-            "recommend_print_parameters",
-            {
-                "stl_path": str(saved_stl_path),
-                "material": chosen_material,
-                "strength_priority": is_strength_priority,
-            },
-            session_id=session_id,
-            trace_log=trace_log,
-        )
-
-        layer_height = float(params_res.get("layer_height", 0.2))
-        infill_int = int(params_res.get("infill_percent", 60 if is_strength_priority else 40))
-
-        # Тул №3: generate_safe_gcode(...)
-        output_gcode_filename = f"{saved_stl_path.stem}_{'5d' if mode_5d_flag else '3d'}.gcode"
-        output_gcode_path = GCODE_DIR / output_gcode_filename
-
-        gcode_res = await invoke_mcp_tool(
-            "generate_safe_gcode",
-            {
-                "stl_path": str(saved_stl_path),
-                "material": chosen_material,
-                "layer_height": layer_height,
-                "infill": infill_int,
-                "mode_5d": mode_5d_flag,
-                "output_gcode_path": str(output_gcode_path),
-            },
-            session_id=session_id,
-            trace_log=trace_log,
-        )
-
-        if output_gcode_path.exists():
-            gcode_url = f"/storage/generated_gcode/{output_gcode_filename}"
-
-        # Тул №4: verify_gcode_security(gcode_path)
-        security_res = await invoke_mcp_tool(
-            "verify_gcode_security",
-            {"gcode_path": str(output_gcode_path)},
-            session_id=session_id,
-            trace_log=trace_log,
-        )
-
-        reply_parts.append(
-            f"**Геометрический анализ (`analyze_stl`):** габариты {stl_analysis_res.get('dimensions_mm')}, "
-            f"объем {stl_analysis_res.get('volume_cm3')} см³, нависания >45°: {stl_analysis_res.get('overhang_percent')}%, "
-            f"риск отрыва от стола: `{stl_analysis_res.get('bed_detachment_risk')}`. "
-            f"Рекомендован режим: **{'5D (Stereotech)' if mode_5d_flag else '3D'}**.\n\n"
-            f"**Параметры печати (`recommend_print_parameters`):** материал `{chosen_material}`, "
-            f"сопло {params_res.get('nozzle_temp')}°C, стол {params_res.get('bed_temp')}°C, "
-            f"слой {layer_height} мм, заполнение {infill_int}%.\n\n"
-            f"**Генерация и аудит G-кода (`generate_safe_gcode` + `verify_gcode_security`):** "
-            f"файл `{output_gcode_filename}`, безопасен: `{security_res.get('is_safe')}`, "
-            f"SHA-256: `{str(security_res.get('sha256_hash', ''))[:16]}...`."
-        )
-
-    # -----------------------------------------------------------------
-    # ВЕТКА Б: Диагностика дефекта или катушки (по фото или тексту)
-    # -----------------------------------------------------------------
-    detected_defect = extract_defect_from_text(message)
-    if photo_file and photo_file.filename:
-        saved_photo = RENDERS_DIR / f"{file_prefix}_{photo_file.filename}"
-        with saved_photo.open("wb") as buffer:
-            shutil.copyfileobj(photo_file.file, buffer)
-        if not detected_defect:
-            detected_defect = "warping"  # Дефолтный класс дефекта при прикреплении фото брака
-
-    if detected_defect:
-        # Тул №5: diagnose_print_defect_or_spool(defect_type, observed_symptoms, current_material)
-        defect_res = await invoke_mcp_tool(
-            "diagnose_print_defect_or_spool",
-            {
-                "defect_type": detected_defect,
-                "observed_symptoms": message,
-                "current_material": chosen_material,
-            },
-            session_id=session_id,
-            trace_log=trace_log,
-        )
-        reply_parts.append(
-            f"**Диагностика дефекта (`diagnose_print_defect_or_spool`):** выявлен `{detected_defect}` "
-            f"на материале `{chosen_material}`. Рекомендации: `{defect_res}`."
-        )
-
-    # -----------------------------------------------------------------
-    # ВЕТКА В: Опрос парка принтеров и отправка задания на печать
-    # -----------------------------------------------------------------
-    wants_fleet = any(w in message.lower() for w in ("принтер", "парк", "статус", "свобод", "отправ", "печат"))
-    if stl_analysis_res or wants_fleet or auto_send_to_printer:
-        # Тул №6: get_fleet_status()
-        fleet_res = await invoke_mcp_tool(
-            "get_fleet_status",
-            {},
-            session_id=session_id,
-            trace_log=trace_log,
-        )
-
-        # Если нужно сразу отправить G-код на принтер
-        wants_dispatch = auto_send_to_printer or any(
-            w in message.lower() for w in ("отправь на печать", "запусти печать", "напечатай")
-        )
-        if wants_dispatch and gcode_res and security_res and security_res.get("is_safe", False):
-            target_kinematics = "5D" if (stl_analysis_res and "5D" in str(stl_analysis_res.get("recommended_mode"))) else "3D"
-            selected_printer_id: Optional[str] = None
-
-            if isinstance(fleet_res, dict):
-                for pid, pinfo in fleet_res.items():
-                    if isinstance(pinfo, dict) and pinfo.get("status") == "IDLE":
-                        if target_kinematics in str(pinfo.get("kinematics", "")).upper():
-                            selected_printer_id = pid
-                            break
-                # Если не нашли по кинематике, берем любой свободный
-                if not selected_printer_id:
-                    for pid, pinfo in fleet_res.items():
-                        if isinstance(pinfo, dict) and pinfo.get("status") == "IDLE":
-                            selected_printer_id = pid
-                            break
-
-            if selected_printer_id:
-                # Тул №7: send_to_printer(printer_id, gcode_path)
-                dispatch_res = await invoke_mcp_tool(
-                    "send_to_printer",
-                    {
-                        "printer_id": selected_printer_id,
-                        "gcode_path": gcode_res.get("output_gcode_path") or str(output_gcode_path),
-                    },
-                    session_id=session_id,
-                    trace_log=trace_log,
-                )
-                reply_parts.append(
-                    f"**Диспетчеризация (`send_to_printer`):** задание отправлено на `{selected_printer_id}` "
-                    f"(статус: `{dispatch_res.get('status')}`)."
-                )
-
-    if not reply_parts:
-        reply_parts.append(
-            "Готов к работе! Загрузите `.stl` модель для автоматического подбора параметров и генерации безопасного "
-            "3D/5D G-кода, прикрепите фото дефекта печати или запросите статус парка принтеров."
-        )
-
-    return ChatOrchestratorResponse(
-        session_id=session_id,
-        reply="\n\n".join(reply_parts),
+    return ChatResponse(
+        session_id=sid,
+        response=response_text,
+        preprocess_events=result.get("preprocess_events", []),
+        elapsed_seconds=result.get("elapsed_seconds", 0),
         stl_url=stl_url,
         gcode_url=gcode_url,
-        stl_analysis=stl_analysis_res,
-        recommended_parameters=params_res,
-        gcode_generation=gcode_res,
-        security_audit=security_res,
-        defect_diagnosis=defect_res,
-        fleet_status=fleet_res,
-        dispatch_result=dispatch_res,
-        mcp_tool_trace=trace_log,
     )
 
 
-# =====================================================================
-# 2. ПРЯМЫЕ ЭНДПОИНТЫ ПОД ИНСТРУМЕНТЫ MCP (Для кнопок на фронтенде)
-# =====================================================================
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_text_only(request: ChatRequest):
+    """Text-only chat endpoint (no file uploads)."""
+    sid = request.session_id or uuid.uuid4().hex[:12]
+    prompt = request.prompt
+    if request.material:
+        prompt += f"\n\nМатериал: {request.material}"
 
-@app.get("/api/fleet", summary="Вызов MCP: get_fleet_status()")
-async def api_get_fleet_status():
-    """Возвращает словарь парка 3D/5D-принтеров Росатома (`printer_3d_1`, `printer_5d_1` и т.д.)."""
-    return await invoke_mcp_tool("get_fleet_status", {})
+    agent = await _get_agent()
+    result = await agent.run(prompt=prompt, files={}, session_id=sid)
 
-
-@app.post("/api/fleet/print", summary="Вызов MCP: send_to_printer(printer_id, gcode_path)")
-async def api_send_to_printer(req: SendToPrinterRequest):
-    """Финальная отправка проверенного G-кода на выбранный принтер из парка."""
-    return await invoke_mcp_tool(
-        "send_to_printer",
-        {"printer_id": req.printer_id, "gcode_path": req.gcode_path},
+    return ChatResponse(
+        session_id=sid,
+        response=result.get("response", ""),
+        preprocess_events=result.get("preprocess_events", []),
+        elapsed_seconds=result.get("elapsed_seconds", 0),
     )
 
 
-@app.post("/api/gcode/verify", summary="Вызов MCP: verify_gcode_security(gcode_path)")
-async def api_verify_gcode(req: VerifyGcodeRequest):
-    """Жесткий статический аудит G-кода и расчет SHA-256 хэша."""
-    return await invoke_mcp_tool("verify_gcode_security", {"gcode_path": req.gcode_path})
+# ---------------------------------------------------------------------------
+# REST: G-code download
+# ---------------------------------------------------------------------------
+
+@app.get("/api/gcode/{filename}")
+async def download_gcode(filename: str):
+    """Download generated G-code file."""
+    path = GCODE_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="G-code file not found")
+    return FileResponse(path, media_type="application/octet-stream", filename=filename)
 
 
-@app.post("/api/diagnose", summary="Вызов MCP: diagnose_print_defect_or_spool(...)")
-async def api_diagnose_defect(req: DiagnoseRequest):
-    """Анализ дефекта печати (stringing, warping, layer_shift, underextrusion) или проблем с катушкой."""
-    return await invoke_mcp_tool(
-        "diagnose_print_defect_or_spool",
-        {
-            "defect_type": req.defect_type,
-            "observed_symptoms": req.observed_symptoms,
-            "current_material": req.current_material,
-        },
+# ---------------------------------------------------------------------------
+# REST: Fleet status
+# ---------------------------------------------------------------------------
+
+@app.get("/api/fleet")
+async def fleet_status():
+    """Get status of all printers in the fleet."""
+    agent = await _get_agent()
+    return await agent.get_fleet_status()
+
+
+@app.post("/api/fleet/dispatch")
+async def dispatch_job(request: DispatchRequest):
+    """Send G-code to a specific printer."""
+    agent = await _get_agent()
+    result = await agent.mcp.call_tool_safe("dispatch_print_job", {
+        "printer_id": request.printer_id,
+        "gcode_path": request.gcode_path,
+    })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# REST: 3D vs 5D Comparison (killer feature)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/compare")
+async def compare_3d_vs_5d(request: CompareRequest):
+    """
+    Run slicing in both 3D and 5D modes and return a comparison card
+    with material savings, time difference, and strength advantage.
+    """
+    agent = await _get_agent()
+    return await agent.compare_3d_vs_5d(
+        stl_path=request.stl_path,
+        slicer_params_3d=request.slicer_params_3d,
+        slicer_params_5d=request.slicer_params_5d,
     )
 
 
-# =====================================================================
-# 3. WEBSOCKET ДЛЯ ЖИВОЙ ТЕЛЕМЕТРИИ И ТРАССИРОВКИ MCP В UI
-# =====================================================================
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    await ws_manager.connect(session_id, websocket)
+# ---------------------------------------------------------------------------
+# REST: Defect Correction (killer feature)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/defect/correct")
+async def correct_defect(request: DefectCorrectionRequest):
+    """
+    Closed-loop defect correction:
+    analyze photo → identify defect → adjust params → re-slice → find printer.
+    """
+    agent = await _get_agent()
+    return await agent.correct_defect(
+        photo_path=request.photo_path,
+        stl_path=request.stl_path,
+        current_params=request.current_params,
+        session_id=request.session_id or uuid.uuid4().hex[:12],
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket: Streaming chat with live tool-call events
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/chat")
+async def ws_chat(ws: WebSocket):
+    """
+    Streaming chat via WebSocket.
+    
+    Client sends: {"prompt": "...", "stl_path": "...", "photo_path": "...", "session_id": "..."}
+    Server yields: {"type": "status|tool_call|tool_result|chunk|done|error", ...}
+    """
+    await ws.accept()
+    agent = await _get_agent()
+
     try:
         while True:
-            await websocket.receive_text()
+            data = await ws.receive_json()
+            session_id = data.get("session_id", uuid.uuid4().hex[:12])
+
+            files = {}
+            if "stl_path" in data:
+                files["stl"] = data["stl_path"]
+            if "photo_path" in data:
+                files["photo"] = data["photo_path"]
+
+            async for event in agent.run_stream(
+                prompt=data.get("prompt", ""),
+                files=files,
+                session_id=session_id,
+            ):
+                await ws.send_json(event)
+
+    except WebSocketDisconnect:
+        logger.info("Chat WebSocket disconnected")
+    except Exception as e:
+        logger.error("WebSocket error: {}", e)
+
+
+@app.websocket("/ws/{session_id}")
+async def ws_session(ws: WebSocket, session_id: str):
+    """
+    Per-session WebSocket for live telemetry and MCP tool-call tracing.
+    Used by the frontend FleetDashboard and MCP trace panel.
+    """
+    await ws_manager.connect(session_id, ws)
+    try:
+        while True:
+            # Keep alive — client can send pings
+            await ws.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(session_id)
 
 
+# ---------------------------------------------------------------------------
+# REST: Health check
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "rosatom-5d-orchestrator"}
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("orchestrator.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)

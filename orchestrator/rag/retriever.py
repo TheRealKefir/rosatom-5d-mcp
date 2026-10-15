@@ -1,205 +1,406 @@
+"""
+orchestrator/rag/retriever.py
+
+RAG retriever module for querying the Qdrant vector database.
+Retrieves relevant engineering knowledge on 3D/5D printing filaments and defect solutions.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
 from loguru import logger
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as rest
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
-# Добавляем корень монорепозитория в sys.path для запуска файла напрямую
+try:
+    from fastembed import TextEmbedding
+except ImportError:  # pragma: no cover
+    TextEmbedding = None  # type: ignore
+
+# Add root of monorepo to sys.path for direct module execution
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from orchestrator.rag.ingest import (
+    COLLECTION_DEFECTS,
+    COLLECTION_FILAMENTS,
+    COLLECTION_KINEMATICS,
     COLLECTION_NAME,
+    DEFAULT_DEFECTS,
+    DEFAULT_FILAMENTS,
     EMBEDDING_MODEL_NAME,
+    VECTOR_SIZE,
     build_documents,
-    compute_embeddings,
     ensure_knowledge_base_files,
-    get_qdrant_client,
-    ingest_knowledge_base,
 )
 
 
-class RosatomKnowledgeRetriever:
+class RAGRetriever:
     """
-    Ретривер базы знаний 3D/5D-печати Росатома (Qdrant + FastEmbed + In-Memory Fallback).
+    Asynchronous RAG retriever for Rosatom 3D/5D additive manufacturing knowledge base.
+    Embeds queries using FastEmbed and retrieves matching records from Qdrant vector store.
     """
 
-    def __init__(self) -> None:
-        self._client: Optional[QdrantClient] = None
-        self._embedder: Any = None
+    DEFAULT_COLLECTIONS: list[str] = [COLLECTION_FILAMENTS, COLLECTION_DEFECTS]
+
+    def __init__(
+        self,
+        qdrant_url: str = "http://qdrant:6333",
+        embedding_model: str = EMBEDDING_MODEL_NAME,
+        timeout: float = 3.0,
+        client: Optional[AsyncQdrantClient] = None,
+    ) -> None:
+        """
+        Initialize the RAG retriever.
+
+        Args:
+            qdrant_url: URL or local path to Qdrant instance. Defaults to 'http://qdrant:6333'.
+            embedding_model: HuggingFace model name for FastEmbed query embedding.
+            timeout: Network request timeout in seconds for Qdrant client.
+            client: Optional pre-configured AsyncQdrantClient instance (useful for testing/mocking).
+        """
+        self.qdrant_url = qdrant_url
+        self.embedding_model_name = embedding_model
+        self.timeout = timeout
+
+        # 1. Initialize AsyncQdrantClient
+        if client is not None:
+            self.client = client
+        elif qdrant_url == ":memory:":
+            self.client = AsyncQdrantClient(location=":memory:")
+        elif os.path.exists(qdrant_url) and os.path.isdir(qdrant_url):
+            self.client = AsyncQdrantClient(path=qdrant_url)
+        else:
+            self.client = AsyncQdrantClient(url=qdrant_url, timeout=timeout)
+
+        # 2. Initialize FastEmbed TextEmbedding
+        self._embedder: Optional[TextEmbedding] = None
+        self._init_embedder()
+
+        # In-memory documents fallback for exact lookup helpers
         self._in_memory_docs: list[dict[str, Any]] = []
-        self._init_storage()
+        try:
+            ensure_knowledge_base_files()
+            self._in_memory_docs = build_documents()
+        except Exception as exc:
+            logger.debug(f"Knowledge base directory initialization note: {exc}")
 
-    def _init_storage(self) -> None:
-        """Гарантирует наличие файлов БЗ и подключается к Qdrant (с резервной копией в памяти)."""
-        ensure_knowledge_base_files()
-        self._in_memory_docs = build_documents()
+    def _init_embedder(self) -> None:
+        """Load the FastEmbed TextEmbedding model, or configure deterministic fallback on error."""
+        if TextEmbedding is None:
+            logger.warning("fastembed is not installed. Deterministic hash embedding will be used as fallback.")
+            self._embedder = None
+            return
 
         try:
-            self._client = get_qdrant_client()
-            collections = [c.name for c in self._client.get_collections().collections]
-            if COLLECTION_NAME not in collections:
-                logger.info(f"Коллекция '{COLLECTION_NAME}' не найдена. Запускаю авто-индексацию...")
-                self._client.close()
-                ingest_knowledge_base(recreate=False)
-                self._client = get_qdrant_client()
+            logger.info(f"Loading FastEmbed model: {self.embedding_model_name}")
+            self._embedder = TextEmbedding(model_name=self.embedding_model_name)
+            logger.success(f"FastEmbed model '{self.embedding_model_name}' loaded successfully.")
         except Exception as exc:
             logger.warning(
-                f"Qdrant временно заблокирован другим процессом ({exc}). "
-                "Активен быстрый In-Memory поиск по справочникам Росатома."
+                f"Failed to load FastEmbed model '{self.embedding_model_name}' ({exc}). "
+                "Deterministic hash embedding will be used as fallback."
             )
-            self._client = None
+            self._embedder = None
+
+    def _fallback_hash_embedding(self, text: str) -> list[float]:
+        """Deterministic fallback embedding generator matching ingest.py."""
+        dim = VECTOR_SIZE
+        vec: list[float] = []
+        text_lower = text.lower()
+        for i in range(dim):
+            h = hashlib.sha256(f"{i}:{text_lower}".encode("utf-8")).digest()
+            val = (int.from_bytes(h[:4], "big") / 0xFFFFFFFF) * 2.0 - 1.0
+            vec.append(round(val, 6))
+        return vec
 
     def _encode_query(self, query: str) -> list[float]:
-        """Кодирует поисковый запрос в вектор размерности 384."""
-        if self._embedder is None:
+        """Encode a text query into a 384-dimensional dense vector."""
+        if self._embedder is not None:
             try:
-                from fastembed import TextEmbedding
-                self._embedder = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
-            except Exception:
-                self._embedder = False
-
-        if self._embedder:
-            try:
-                return list(self._embedder.embed([query]))[0].tolist()
+                embeddings = list(self._embedder.embed([query]))
+                if embeddings:
+                    return embeddings[0].tolist()
             except Exception as exc:
-                logger.warning(f"Ошибка FastEmbed при кодировании запроса ({exc}), используем fallback.")
+                logger.warning(f"FastEmbed error during encoding ({exc}), falling back to hash embedding.")
 
-        return compute_embeddings([query])[0]
+        return self._fallback_hash_embedding(query)
 
-    # =====================================================================
-    # 1. Универсальный векторный поиск с фильтрацией по типу документа
-    # =====================================================================
-    def search(
+    async def _search_single_collection(
         self,
-        query: str,
-        doc_type: Optional[str] = None,
-        top_k: int = 3,
-    ) -> list[dict[str, Any]]:
-        """
-        Ищет релевантные документы в Qdrant.
-        doc_type может быть: 'filament', 'defect', 'kinematics_and_security' или None (искать везде).
-        """
-        query_vector = self._encode_query(query)
-
-        if self._client is not None:
-            try:
-                query_filter = None
-                if doc_type:
-                    query_filter = rest.Filter(
-                        must=[
-                            rest.FieldCondition(
-                                key="doc_type",
-                                match=rest.MatchValue(value=doc_type),
-                            )
-                        ]
-                    )
-
-                # Поддержка нового API query_points (qdrant-client >= 1.10) и классического search
-                if hasattr(self._client, "query_points"):
-                    response = self._client.query_points(
-                        collection_name=COLLECTION_NAME,
-                        query=query_vector,
-                        query_filter=query_filter,
-                        limit=top_k,
-                        with_payload=True,
-                    )
-                    hits = response.points
-                else:
-                    hits = self._client.search(
-                        collection_name=COLLECTION_NAME,
-                        query_vector=query_vector,
-                        query_filter=query_filter,
-                        limit=top_k,
-                        with_payload=True,
-                    )
-
-                results: list[dict[str, Any]] = []
-                for hit in hits:
-                    payload = hit.payload or {}
-                    results.append(
-                        {
-                            "score": round(float(hit.score), 4),
-                            "doc_type": payload.get("doc_type"),
-                            "key": payload.get("key"),
-                            "text": payload.get("text", ""),
-                            "metadata": payload.get("metadata", {}),
-                        }
-                    )
-                if results:
-                    return results
-            except Exception as exc:
-                logger.warning(f"Ошибка векторного поиска Qdrant ({exc}), переключение на In-Memory поиск.")
-
-        # Fallback: поиск по документам в памяти
-        return self._fallback_in_memory_search(query=query, doc_type=doc_type, top_k=top_k)
-
-    def _fallback_in_memory_search(
-        self,
-        query: str,
-        doc_type: Optional[str],
+        collection_name: str,
+        query_vector: list[float],
         top_k: int,
     ) -> list[dict[str, Any]]:
-        """Резервный поиск по ключевым словам и подстрокам, если файловый Qdrant занят."""
-        candidates = [
-            d for d in self._in_memory_docs if (doc_type is None or d["doc_type"] == doc_type)
+        """
+        Query a single Qdrant collection, with automatic fallback to unified KB collection.
+        Handles connection and collection errors gracefully.
+        """
+        try:
+            # Query the requested collection
+            points = await self._execute_query_points(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                top_k=top_k,
+            )
+            if points is not None:
+                return self._format_points(points, collection_name)
+        except (ResponseHandlingException, OSError, TimeoutError, ConnectionError) as exc:
+            logger.warning(f"Qdrant connection error while querying '{collection_name}': {exc}")
+            return []
+        except Exception as exc:
+            logger.debug(f"Direct query on collection '{collection_name}' failed: {exc}. Attempting fallback...")
+
+        # If collection doesn't exist directly, check fallback in unified COLLECTION_NAME (e.g. rosatom_3d_5d_kb)
+        try:
+            fallback_points = await self._query_unified_kb_fallback(
+                target_collection=collection_name,
+                query_vector=query_vector,
+                top_k=top_k,
+            )
+            if fallback_points:
+                return self._format_points(fallback_points, collection_name)
+        except (ResponseHandlingException, OSError, TimeoutError, ConnectionError) as exc:
+            logger.warning(f"Qdrant connection error during fallback query: {exc}")
+            return []
+        except Exception as exc:
+            logger.debug(f"Fallback query on unified collection failed: {exc}")
+
+        return []
+
+    async def _execute_query_points(
+        self,
+        collection_name: str,
+        query_vector: list[float],
+        top_k: int,
+        query_filter: Optional[rest.Filter] = None,
+    ) -> Optional[list[Any]]:
+        """Execute query_points or search on client."""
+        if hasattr(self.client, "query_points"):
+            response = await self.client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                query_filter=query_filter,
+                limit=top_k,
+                with_payload=True,
+            )
+            return response.points
+        elif hasattr(self.client, "search"):
+            return await self.client.search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                query_filter=query_filter,
+                limit=top_k,
+                with_payload=True,
+            )
+        return None
+
+    async def _query_unified_kb_fallback(
+        self,
+        target_collection: str,
+        query_vector: list[float],
+        top_k: int,
+    ) -> list[Any]:
+        """Query unified COLLECTION_NAME with doc_type filter if specific collection is absent."""
+        doc_type_filter: Optional[str] = None
+        col_lower = target_collection.lower()
+        if "filament" in col_lower:
+            doc_type_filter = "filament"
+        elif "defect" in col_lower:
+            doc_type_filter = "defect"
+        elif "kinematic" in col_lower or "security" in col_lower:
+            doc_type_filter = "kinematics_and_security"
+
+        qf = None
+        if doc_type_filter:
+            qf = rest.Filter(
+                must=[rest.FieldCondition(key="doc_type", match=rest.MatchValue(value=doc_type_filter))]
+            )
+
+        points = await self._execute_query_points(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            top_k=top_k,
+            query_filter=qf,
+        )
+        return points or []
+
+    def _format_points(self, points: list[Any], collection_name: str) -> list[dict[str, Any]]:
+        """Format Qdrant points into structured dicts with score, payload, and text."""
+        results: list[dict[str, Any]] = []
+        for p in points:
+            payload = p.payload or {}
+            score = round(float(p.score), 4) if getattr(p, "score", None) is not None else 0.0
+            results.append({
+                "id": p.id,
+                "score": score,
+                "collection": collection_name,
+                "payload": payload,
+                "text": payload.get("text", ""),
+                "metadata": payload.get("metadata", {}),
+            })
+        return results
+
+    async def search_filaments(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+        """
+        Search the 'filaments' collection for materials, printing regimes, and drying guidelines.
+
+        Args:
+            query: Natural language query (e.g. 'высокотемпературный пластик для 5D').
+            top_k: Number of top documents to return.
+
+        Returns:
+            List of structured dicts with score, payload, text, and collection metadata.
+        """
+        return await self.search(query=query, collections=[COLLECTION_FILAMENTS], top_k=top_k)
+
+    async def search_defects(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+        """
+        Search the 'defects' collection for print failures, root causes, and troubleshooting actions.
+
+        Args:
+            query: Natural language query (e.g. 'паутина между деталями', 'отрыв углов от стола').
+            top_k: Number of top documents to return.
+
+        Returns:
+            List of structured dicts with score, payload, text, and collection metadata.
+        """
+        return await self.search(query=query, collections=[COLLECTION_DEFECTS], top_k=top_k)
+
+    async def search(
+        self,
+        query: str,
+        collections: list[str] | None = None,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """
+        Unified semantic search across specified collections or all standard knowledge collections.
+
+        Args:
+            query: Natural language query string.
+            collections: List of collection names to search. Defaults to ['filaments', 'defects'].
+            top_k: Total number of most relevant documents to return across all collections.
+
+        Returns:
+            List of structured result dicts sorted by relevance score in descending order.
+        """
+        clean_query = query.strip() if query else ""
+        if not clean_query:
+            return []
+
+        target_collections = collections if collections is not None else self.DEFAULT_COLLECTIONS
+        if isinstance(target_collections, str):
+            target_collections = [target_collections]
+
+        try:
+            query_vector = await asyncio.to_thread(self._encode_query, clean_query)
+        except Exception as exc:
+            logger.warning(f"Error encoding query '{clean_query}': {exc}")
+            return []
+
+        # Execute searches across all target collections concurrently
+        tasks = [
+            self._search_single_collection(col, query_vector=query_vector, top_k=top_k)
+            for col in target_collections
         ]
-        q_words = [w.lower() for w in query.split() if len(w) > 2]
+        results_nested = await asyncio.gather(*tasks, return_exceptions=True)
 
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for doc in candidates:
-            haystack = f"{doc['key']} {doc['text']}".lower()
-            score = sum(1.0 for w in q_words if w in haystack)
-            if doc["key"].lower() in query.lower():
-                score += 5.0
-            scored.append((score, doc))
+        all_results: list[dict[str, Any]] = []
+        for res in results_nested:
+            if isinstance(res, list):
+                all_results.extend(res)
+            elif isinstance(res, Exception):
+                logger.warning(f"Collection search task encountered an error: {res}")
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [
-            {
-                "score": round(s, 2),
-                "doc_type": d["doc_type"],
-                "key": d["key"],
-                "text": d["text"],
-                "metadata": d["metadata"],
-            }
-            for s, d in scored[:top_k]
-        ]
+        # Sort combined results by similarity score descending
+        all_results.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return all_results[:top_k]
 
-    # =====================================================================
-    # 2. Специализированный метод под тул `recommend_print_parameters`
-    # =====================================================================
+    def format_context(self, results: list[dict[str, Any]]) -> str:
+        """
+        Format retrieved documents into a clean Markdown context string for LLM prompt injection.
+
+        Args:
+            results: List of structured search result dicts.
+
+        Returns:
+            Formatted string ready for inclusion in system or user prompt.
+        """
+        if not results:
+            return ""
+
+        doc_blocks: list[str] = []
+        for idx, item in enumerate(results, start=1):
+            score = item.get("score", 0.0)
+            collection = item.get("collection", "knowledge_base")
+            payload = item.get("payload", {})
+            text = item.get("text") or payload.get("text")
+
+            header = f"[{idx}] Справка из базы знаний: `{collection}` (релевантность: {score:.2f})"
+
+            if text and str(text).strip():
+                content = str(text).strip()
+            else:
+                lines: list[str] = []
+                for k, v in payload.items():
+                    if k in ("id", "vector", "doc_type"):
+                        continue
+                    if isinstance(v, (dict, list)):
+                        lines.append(f"- **{k}**: {json.dumps(v, ensure_ascii=False)}")
+                    else:
+                        lines.append(f"- **{k}**: {v}")
+                content = "\n".join(lines) if lines else json.dumps(payload, ensure_ascii=False)
+
+            doc_blocks.append(f"{header}\n{content}")
+
+        return "\n\n".join(doc_blocks)
+
+    async def close(self) -> None:
+        """Close connection to Qdrant client."""
+        try:
+            if hasattr(self.client, "close"):
+                await self.client.close()
+        except Exception as exc:
+            logger.debug(f"Error closing Qdrant client: {exc}")
+
+    # =========================================================================
+    # Compatibility helpers (for direct profile & defect queries)
+    # =========================================================================
+
     def get_filament_profile(
         self,
         material: str,
         strength_priority: bool = False,
     ) -> dict[str, Any]:
         """
-        Возвращает точный технологический профиль материала из базы Росатома.
-        Если точное имя не найдено, ищет ближайший аналог через векторный поиск.
+        Synchronous helper returning standard Rosatom technical parameters for a material.
+        Falls back to default filaments database if Qdrant is offline.
         """
         mat_clean = material.strip().upper()
-
-        # 1. Сначала проверяем точное совпадение по коду материала (PLA, ABS, PETG, PA12-CF, PEEK)
         exact_meta: Optional[dict[str, Any]] = None
+
         for doc in self._in_memory_docs:
-            if doc["doc_type"] == "filament" and doc["key"].upper() == mat_clean:
-                exact_meta = doc["metadata"]
+            if doc.get("doc_type") == "filament" and str(doc.get("key", "")).upper() == mat_clean:
+                exact_meta = doc.get("metadata")
                 break
 
-        # 2. Если точного совпадения нет (например, запросили "карбоновый нейлон"), ищем семантически
         if exact_meta is None:
-            hits = self.search(query=f"Материал пластик {material}", doc_type="filament", top_k=1)
-            if hits and hits[0].get("metadata"):
-                exact_meta = hits[0]["metadata"]
+            for item in DEFAULT_FILAMENTS:
+                if item["material"].upper() == mat_clean:
+                    exact_meta = item
+                    break
 
         if exact_meta is None:
-            # Дефолтный профиль PA12-CF на случай неизвестного полимера
-            exact_meta = self._in_memory_docs[0]["metadata"]
+            exact_meta = DEFAULT_FILAMENTS[0]  # Default to PLA
 
         infill = (
             exact_meta.get("infill_percent_strength", 80)
@@ -225,9 +426,6 @@ class RosatomKnowledgeRetriever:
             "notes": exact_meta.get("notes", ""),
         }
 
-    # =====================================================================
-    # 3. Специализированный метод под тул `diagnose_print_defect_or_spool`
-    # =====================================================================
     def get_defect_solution(
         self,
         defect_type: str,
@@ -235,29 +433,25 @@ class RosatomKnowledgeRetriever:
         current_material: str = "ABS",
     ) -> dict[str, Any]:
         """
-        Находит регламент устранения дефекта печати или проблемы с катушкой
-        и адаптирует его под текущий материал.
+        Synchronous helper returning standard troubleshooting guide for a print defect.
         """
         defect_clean = defect_type.strip().lower()
-        matched_defect: Optional[dict[str, Any]] = None
+        matched: Optional[dict[str, Any]] = None
 
-        # 1. Точное совпадение по коду дефекта (stringing, warping, layer_shift, underextrusion)
         for doc in self._in_memory_docs:
-            if doc["doc_type"] == "defect" and doc["key"].lower() == defect_clean:
-                matched_defect = doc["metadata"]
+            if doc.get("doc_type") == "defect" and str(doc.get("key", "")).lower() == defect_clean:
+                matched = doc.get("metadata")
                 break
 
-        # 2. Семантический поиск по описанию симптомов
-        if matched_defect is None:
-            search_query = f"{defect_type} {observed_symptoms}".strip()
-            hits = self.search(query=search_query, doc_type="defect", top_k=1)
-            if hits and hits[0].get("metadata"):
-                matched_defect = hits[0]["metadata"]
+        if matched is None:
+            for item in DEFAULT_DEFECTS:
+                if item["defect_type"].lower() == defect_clean:
+                    matched = item
+                    break
 
-        # Подтягиваем также профиль текущего материала, чтобы дать точный режим сушки катушки
         mat_profile = self.get_filament_profile(current_material)
 
-        if matched_defect is None:
+        if matched is None:
             return {
                 "defect_type": defect_type,
                 "current_material": mat_profile["material"],
@@ -268,24 +462,19 @@ class RosatomKnowledgeRetriever:
                 ],
             }
 
-        actions = list(matched_defect.get("operator_actions", []))
+        actions = list(matched.get("operator_actions", []))
         if mat_profile.get("drying_regime"):
-            actions.append(
-                f"Режим сушки катушки для {mat_profile['material']}: {mat_profile['drying_regime']}"
-            )
+            actions.append(f"Режим сушки катушки для {mat_profile['material']}: {mat_profile['drying_regime']}")
 
         return {
-            "defect_type": matched_defect.get("defect_type", defect_clean),
-            "title": matched_defect.get("title", ""),
+            "defect_type": matched.get("defect_type", defect_clean),
+            "title": matched.get("title", ""),
             "current_material": mat_profile["material"],
-            "root_causes": matched_defect.get("root_causes", []),
-            "parameter_adjustments": matched_defect.get("parameter_adjustments", {}),
+            "root_causes": matched.get("root_causes", []),
+            "parameter_adjustments": matched.get("parameter_adjustments", {}),
             "operator_actions": actions,
         }
 
-    # =====================================================================
-    # 4. Сборка контекста для промпта LLM-оркестратора
-    # =====================================================================
     def build_rag_context(
         self,
         user_query: str,
@@ -293,8 +482,7 @@ class RosatomKnowledgeRetriever:
         defect_type: Optional[str] = None,
     ) -> str:
         """
-        Формирует структурированную выжимку из базы знаний Росатома
-        для подачи в системный промпт LLM перед вызовом инструментов MCP.
+        Synchronous context assembler for agent reasoning prompt.
         """
         sections: list[str] = ["### КОНТЕКСТ ИЗ БАЗЫ ЗНАНИЙ РОСАТОМА (RAG):"]
 
@@ -315,46 +503,19 @@ class RosatomKnowledgeRetriever:
                 f"действия оператора={'; '.join(sol['operator_actions'])}."
             )
 
-        general_hits = self.search(query=user_query, top_k=2)
-        for idx, hit in enumerate(general_hits, start=1):
-            sections.append(f"- **Справка #{idx} [{hit['doc_type']} / {hit['key']}]:** {hit['text']}")
-
         return "\n".join(sections)
 
 
-# Глобальный Singleton-экземпляр, чтобы не открывать несколько соединений к локальному Qdrant
-_retriever_instance: Optional[RosatomKnowledgeRetriever] = None
+# Backwards compatibility alias
+RosatomKnowledgeRetriever = RAGRetriever
+
+_retriever_instance: Optional[RAGRetriever] = None
 
 
-def get_retriever() -> RosatomKnowledgeRetriever:
-    """Возвращает инициализированный Singleton-ретривер для использования в main.py и agent/router.py."""
+def get_retriever() -> RAGRetriever:
+    """Return a singleton instance of RAGRetriever."""
     global _retriever_instance
     if _retriever_instance is None:
-        _retriever_instance = RosatomKnowledgeRetriever()
+        qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
+        _retriever_instance = RAGRetriever(qdrant_url=qdrant_url)
     return _retriever_instance
-
-
-# =====================================================================
-# Самопроверка модуля при запуске из консоли
-# =====================================================================
-if __name__ == "__main__":
-    r = get_retriever()
-
-    print("\n1. Тест подбора профиля материала (PA12-CF, силовой режим):")
-    print(json.dumps(r.get_filament_profile("PA12-CF", strength_priority=True), ensure_ascii=False, indent=2))
-
-    print("\n2. Тест диагностики дефекта по симптомам:")
-    print(
-        json.dumps(
-            r.get_defect_solution(
-                defect_type="warping",
-                observed_symptoms="Отрывает углы детали от стола и пошли трещины между слоями",
-                current_material="ABS",
-            ),
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-
-    print("\n3. Тест сборки RAG-контекста для LLM:")
-    print(r.build_rag_context("Нужно напечатать кронштейн с большими нависаниями без поддержек", material="PA12-CF"))

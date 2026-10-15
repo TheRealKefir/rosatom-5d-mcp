@@ -1,95 +1,214 @@
-from __future__ import annotations
-import re, logging
+"""
+MCP tool descriptions used by the LLM as function-calling schema.
+Loaded from prompts/tools/*.md and converted to OpenAI-style tool dicts.
+
+These tool definitions match the ACTUAL MCP server tools in mcp_server/server.py:
+ - analyze_stl
+ - recommend_print_parameters
+ - generate_safe_gcode
+ - verify_gcode_security
+ - diagnose_print_defect_or_spool
+ - get_fleet_status
+ - send_to_printer
+"""
+
 from pathlib import Path
-from typing import Iterator
-import yaml
-from jinja2 import Environment, BaseLoader, meta
+from typing import Any
 
-from .types import Prompt, PromptMeta
-
-log = logging.getLogger("prompts")
-
-_FRONT = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
-
-class PromptError(RuntimeError):
-    """Error with prompts."""
+TOOLS_DIR = Path(__file__).parent / "prompts" / "tools"
 
 
-class PromptRegistry:
-    def __init__(self, root: str | Path, strict: bool = True):
-        self.root = Path(root)
-        self.strict = strict
-        self._cache: dict[str, Prompt] = {}
-        self._env = Environment(loader=BaseLoader(), autoescape=False,
-                                trim_blocks=True, lstrip_blocks=True)
-        self.load_all()
+def _load_tool_description(filename: str) -> str:
+    """Load tool description from markdown file, stripping front matter."""
+    path = TOOLS_DIR / filename
+    if not path.exists():
+        return f"Tool description from {filename}"
+    
+    text = path.read_text(encoding="utf-8")
+    
+    # Strip YAML front matter
+    if text.startswith("---"):
+        lines = text.split("\n")
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                text = "\n".join(lines[i + 1:])
+                break
+    
+    return text.strip()
 
-    def load_all(self) -> None:
-        self._cache.clear()
-        files = sorted(self.root.glob("*.md")) + sorted(self.root.glob("*.j2"))
-        for path in files:
-            if "_drafts" in path.parts:
-                continue
-            p = self._parse(path)
-            self._validate(p)
-            self._cache[p.meta.name] = p
-        log.info("загружено промптов: %d → %s",
-                 len(self._cache), ", ".join(f"{k}@{v.meta.version}" for k, v in self._cache.items()))
 
-    def _parse(self, path: Path) -> Prompt:
-        raw = path.read_text(encoding="utf-8")
-        m = _FRONT.match(raw)
-        if not m:
-            raise PromptError(f"{path}: no YAML front matter")
-        meta_d = yaml.safe_load(m.group(1)) or {}
-        body = raw[m.end():]
-        meta = PromptMeta(
-            name=meta_d.get("name", path.stem.split(".")[0]),
-            version=str(meta_d.get("version", "1.0")),
-            role=meta_d.get("role", "system"),
-            model=meta_d.get("model"),
-            temperature=meta_d.get("temperature"),
-            max_tokens=meta_d.get("max_tokens"),
-            vars=tuple(meta_d.get("vars", []) or []),
-            tags=tuple(meta_d.get("tags", []) or []),
-            path=path,
-        )
-        tpl = self._env.from_string(body) if meta.vars else None
-        return Prompt(meta=meta, body=body, _template=tpl)
-
-    def _validate(self, p: Prompt) -> None:
-        declared = set(p.meta.vars)
-        if p._template is not None:
-            found = meta.find_undeclared_variables(p._template.environment.parse(p.body))
-            undeclared = found - declared
-            unused = declared - found
-            if undeclared and self.strict:
-                raise PromptError(
-                    f"[{p.meta.name}] в шаблоне есть {{{{ {sorted(undeclared)} }}}}, "
-                    f"но они не объявлены в front matter 'vars'")
-            if unused and self.strict:
-                raise PromptError(
-                    f"[{p.meta.name}] объявлены, но не используются: {sorted(unused)}")
-        if p.meta.name in self._cache:
-            raise PromptError(f"дубликат имени промпта: {p.meta.name}")
-
-    def get(self, name: str) -> Prompt:
-        try:
-            return self._cache[name]
-        except KeyError:
-            raise PromptError(f"промпт '{name}' не найден. Есть: {sorted(self._cache)}") from None
-
-    def __getattr__(self, name: str) -> Prompt:
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return self.get(name)
-
-    def __contains__(self, name: str) -> bool:
-        return name in self._cache
-
-    def __iter__(self) -> Iterator[Prompt]:
-        return iter(self._cache.values())
-
-    def reload(self) -> None:
-        log.warning("reload prompts...")
-        self.load_all()
+# OpenAI function-calling compatible definitions
+# These match the actual @mcp.tool() functions in mcp_server/server.py
+MCP_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_stl",
+            "description": _load_tool_description("analyze_ctl_geometry.md"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stl_path": {
+                        "type": "string",
+                        "description": "Путь к STL-файлу 3D-модели",
+                    }
+                },
+                "required": ["stl_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recommend_print_parameters",
+            "description": _load_tool_description("calculate_print_parameters.md"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stl_path": {
+                        "type": "string",
+                        "description": "Путь к STL-файлу",
+                    },
+                    "material": {
+                        "type": "string",
+                        "description": "Целевой материал (PLA, ABS, PETG, PA12-CF, PEEK)",
+                        "enum": ["PLA", "ABS", "PETG", "PA12-CF", "PEEK", "ASA", "PC", "NYLON"],
+                    },
+                    "strength_priority": {
+                        "type": "string",
+                        "description": "Приоритет прочности: 'max_strength', 'balanced', 'fast_prototype'",
+                        "enum": ["max_strength", "balanced", "fast_prototype"],
+                    },
+                },
+                "required": ["stl_path", "material"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_safe_gcode",
+            "description": _load_tool_description("slice_model.md"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stl_path": {
+                        "type": "string",
+                        "description": "Путь к STL-файлу",
+                    },
+                    "material": {
+                        "type": "string",
+                        "description": "Материал печати (PLA, ABS, PETG, PA12-CF, PEEK)",
+                    },
+                    "layer_height": {
+                        "type": "number",
+                        "description": "Высота слоя в мм (0.1-0.4)",
+                    },
+                    "infill": {
+                        "type": "integer",
+                        "description": "Процент заполнения (0-100)",
+                    },
+                    "mode_5d": {
+                        "type": "boolean",
+                        "description": "Включить 5D-режим Stereotech (многоосевая печать без поддержек)",
+                    },
+                    "output_gcode_path": {
+                        "type": "string",
+                        "description": "Путь для сохранения G-кода (опционально)",
+                    },
+                },
+                "required": ["stl_path", "material", "layer_height", "infill", "mode_5d"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_gcode_security",
+            "description": (
+                "Статический аудит безопасности G-кода перед отправкой на принтер. "
+                "Проверяет: наличие G28 (homing), температурные лимиты, "
+                "габаритный коридор, вычисляет SHA-256 хэш."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gcode_path": {
+                        "type": "string",
+                        "description": "Путь к .gcode файлу для проверки",
+                    }
+                },
+                "required": ["gcode_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "diagnose_print_defect_or_spool",
+            "description": _load_tool_description("analyze_visual_data.md"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "defect_type": {
+                        "type": "string",
+                        "description": "Тип дефекта: warping, stringing, delamination, under_extrusion, layer_shift, wet_filament",
+                    },
+                    "observed_symptoms": {
+                        "type": "string",
+                        "description": "Описание наблюдаемых симптомов",
+                    },
+                    "current_material": {
+                        "type": "string",
+                        "description": "Текущий используемый материал",
+                    },
+                    "current_nozzle_temp_c": {
+                        "type": "number",
+                        "description": "Текущая температура сопла (опционально)",
+                    },
+                    "current_bed_temp_c": {
+                        "type": "number",
+                        "description": "Текущая температура стола (опционально)",
+                    },
+                },
+                "required": ["defect_type", "observed_symptoms"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fleet_status",
+            "description": _load_tool_description("manage_printer_fleet.md"),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_to_printer",
+            "description": (
+                "Отправляет проверенный G-код на конкретный принтер из парка. "
+                "Перед отправкой автоматически выполняет проверку безопасности "
+                "и соответствия габаритов области печати принтера."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "printer_id": {
+                        "type": "string",
+                        "description": "ID принтера (STEREO-5D-01, STEREO-5D-02, PRUSA-3D-01)",
+                    },
+                    "gcode_path": {
+                        "type": "string",
+                        "description": "Путь к .gcode файлу для отправки",
+                    },
+                },
+                "required": ["printer_id", "gcode_path"],
+            },
+        },
+    },
+]
